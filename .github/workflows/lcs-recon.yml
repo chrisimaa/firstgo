@@ -26,6 +26,4 @@ jobs:
           ZOHO_CLIENT_SECRET:          ${{ secrets.ZOHO_CLIENT_SECRET }}
           ZOHO_REFRESH_TOKEN:          ${{ secrets.ZOHO_REFRESH_TOKEN }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          SENDGRID_API_KEY:            ${{ secrets.SENDGRID_API_KEY }}
-          REPORT_EMAIL:                chris@imaa.world
         run: python scripts/recon.py

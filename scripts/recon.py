@@ -3,20 +3,28 @@
 LCS vs CRM Training_Modules reconciliation.
 
 Reads from environment variables, fetches live data via REST APIs,
-prints a report to stdout, and emails via SendGrid if SENDGRID_API_KEY is set.
+and prints a report to stdout.
 
 Matching priority:
   1. S-number + module_type  (e.g. S23 + srfnd)
   2. module_type + start_date ±2 days
 """
-import json, re, os, sys
-from datetime import datetime, timedelta
+import json, re, os, html, argparse
+from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 import requests
 
 # ── Config ──────────────────────────────────────────────────────────────────────
 SPREADSHEET_ID = '109j8qpzauXZUJ32vm8FA7y6PZlLRkzHIjl2wV-TYVRM'
 CUTOFF = datetime(2026, 1, 1)
+
+CRM_ORG     = '688920719'                 # Zoho CRM org id (for record links)
+TC_TAB      = 'CustomModule4'             # Training_Course tab segment in CRM URLs
+REPORT_HTML = os.environ.get('REPORT_HTML', 'report.html')
+
+HERENOW_API  = 'https://here.now/api/v1'
+HERENOW_CRED = os.path.expanduser('~/.herenow/credentials')
+HERENOW_SLUG = os.environ.get('HERENOW_SLUG_FILE', '.herenow-slug')  # remembers the fixed site
 
 COL_MODULE   = 2
 COL_DATE     = 3
@@ -69,6 +77,10 @@ def lcs_module_type(module_name):
 
 def should_skip_type(mtype, module_name):
     if mtype in ADMIN_TYPES:
+        return True
+    # Multi-word admin names like "CEC Workshop" / "CEC Pre and Post natal"
+    # normalize to "cec workshop" etc.; skip when the leading word is admin.
+    if mtype.split() and mtype.split()[0] in ADMIN_TYPES:
         return True
     mname_lower = module_name.lower()
     for prefix in SKIP_PREFIXES:
@@ -134,17 +146,72 @@ def build_crm_lookups(crm_records):
     return by_series, by_date
 
 
-def find_in_crm(lcs_module_name, lcs_date_str, by_series, by_date):
+DATE_WINDOW = 2  # ± days a CRM run may differ from the LCS date and still match
+
+
+def tm_date(tm):
+    """Parsed start date for a CRM TM, cached on the record."""
+    if 'parsed_date' not in tm:
+        try:
+            tm['parsed_date'] = datetime.strptime(tm['start_date'], '%Y-%m-%d')
+        except (ValueError, KeyError):
+            tm['parsed_date'] = None
+    return tm['parsed_date']
+
+
+def find_in_crm(lcs_module_name, lcs_date, by_series, by_date):
+    """Resolve an LCS row to CRM TM(s).
+
+    Returns (tms, method). Methods, strongest first:
+      series+date  exact series, run within ±DATE_WINDOW days  → trust for TC compare
+      date         no S-number, matched by module type + date
+      series-only  series exists in CRM but no run near this date (schedule differs)
+    """
     mtype = lcs_module_type(lcs_module_name)
     s_num = lcs_s_number(lcs_module_name)
+    lcs_date_str = lcs_date.strftime('%Y-%m-%d')
+
     if s_num:
-        hits = by_series.get((mtype, s_num), [])
-        if hits:
-            return hits, f'series:{mtype}/{s_num}'
+        series_hits = by_series.get((mtype, s_num), [])
+        if series_hits:
+            near = [tm for tm in series_hits
+                    if tm_date(tm) and abs((tm_date(tm) - lcs_date).days) <= DATE_WINDOW]
+            if near:
+                return near, f'series+date:{mtype}/{s_num}'
+            return series_hits, f'series-only:{mtype}/{s_num}'
+
     hits = by_date.get((mtype, lcs_date_str), [])
     if hits:
         return hits, f'date:{mtype}/{lcs_date_str}'
     return [], None
+
+
+def find_duplicate_tms(crm_records):
+    """CRM TMs sharing a TM-number — a data-integrity problem in CRM itself.
+
+    Only records carrying a real TM-#### identifier are candidates. Records
+    without one (e.g. CRAF) are each legitimately tied to their own Training_Course,
+    so identical CRAF names across different TCs are not duplicates.
+    """
+    by_number = defaultdict(list)
+    for tm in crm_records:
+        m = re.match(r'\s*(TM-\d+)', tm['name'])
+        if not m:
+            continue
+        by_number[m.group(1)].append(tm)
+    dups = []
+    for num, recs in by_number.items():
+        if len(recs) > 1:
+            dups.append({
+                'tm_number': num,
+                'count':     len(recs),
+                'names':     [r['name'] for r in recs],
+                'tc_ids':    sorted({r['tc_id'] for r in recs if r.get('tc_id')}),
+                'records':   [{'id': r['id'], 'name': r['name'],
+                               'tc_id': r.get('tc_id', ''), 'date': r.get('start_date', '')}
+                              for r in recs],
+            })
+    return sorted(dups, key=lambda x: x['tm_number'])
 
 
 # ── Zoho CRM ────────────────────────────────────────────────────────────────────
@@ -224,6 +291,7 @@ def fetch_lcs_sheet(token):
 def reconcile(lcs_rows, crm_records):
     by_series, by_date = build_crm_lookups(crm_records)
     missing     = []
+    date_diff   = []   # series in CRM, but no run within ±DATE_WINDOW of the LCS date
     tc_mismatch = []
     checked     = 0
 
@@ -253,13 +321,21 @@ def reconcile(lcs_rows, crm_records):
         date_str = date.strftime('%Y-%m-%d')
         checked += 1
 
-        tms, method = find_in_crm(module_name, date_str, by_series, by_date)
+        tms, method = find_in_crm(module_name, date, by_series, by_date)
         if not tms:
             missing.append({
                 'row': i + 1, 'module': module_name, 'type': mtype,
                 'date': date_str, 'date_raw': date_raw,
                 'host': host, 'host_rep': host_rep,
                 'status': status, 'crm_link': crm_link, 'tc': tc_col,
+            })
+        elif method.startswith('series-only'):
+            # Series exists but no run near this date — likely a schedule
+            # difference, not a TC problem. Don't compare TC links here.
+            date_diff.append({
+                'row': i + 1, 'module': module_name, 'date': date_str,
+                'host': host, 'host_rep': host_rep,
+                'crm_dates': sorted(tm['start_date'] for tm in tms if tm.get('start_date')),
             })
         else:
             lcs_tc_id = extract_tc_id(crm_link)
@@ -273,51 +349,13 @@ def reconcile(lcs_rows, crm_records):
                         'crm_tms': [tm['name'] for tm in tms],
                     })
 
-    return checked, missing, tc_mismatch
+    return checked, missing, date_diff, tc_mismatch
 
 
 # ── Report ──────────────────────────────────────────────────────────────────────
-def build_report_html(checked, missing, tc_mismatch, run_date):
-    td = 'style="padding:4px 8px;border:1px solid #ccc"'
-    th = 'style="padding:4px 8px;border:1px solid #ccc;background:#f0f0f0"'
-
-    parts = [
-        f'<h2>LCS Reconciliation Report — {run_date}</h2>',
-        f'<p>LCS rows checked (2026+, active, non-admin): <strong>{checked}</strong></p>',
-        f'<h3>Missing from CRM ({len(missing)} entries)</h3>',
-    ]
-
-    if missing:
-        parts.append(f'<table style="border-collapse:collapse;font-family:monospace;font-size:12px">')
-        parts.append(f'<tr><th {th}>Row</th><th {th}>Module</th><th {th}>Date</th>'
-                     f'<th {th}>Host</th><th {th}>Host Rep</th><th {th}>LCS CRM Link</th></tr>')
-        for m in sorted(missing, key=lambda x: x['date']):
-            link = f'<a href="{m["crm_link"]}">{m["crm_link"][:60]}</a>' if m['crm_link'] else ''
-            parts.append(f'<tr><td {td}>{m["row"]}</td><td {td}>{m["module"]}</td>'
-                         f'<td {td}>{m["date"]}</td><td {td}>{m["host"]}</td>'
-                         f'<td {td}>{m["host_rep"]}</td><td {td}>{link}</td></tr>')
-        parts.append('</table>')
-    else:
-        parts.append('<p style="color:green"><strong>All LCS entries found in CRM.</strong></p>')
-
-    if tc_mismatch:
-        parts.append(f'<h3>TC Link Mismatches ({len(tc_mismatch)} entries — TM found but TC link differs)</h3>')
-        parts.append(f'<table style="border-collapse:collapse;font-family:monospace;font-size:12px">')
-        parts.append(f'<tr><th {th}>Row</th><th {th}>Module</th><th {th}>Date</th>'
-                     f'<th {th}>Host</th><th {th}>Match method</th>'
-                     f'<th {th}>LCS TC ID</th><th {th}>CRM TC ID(s)</th></tr>')
-        for m in sorted(tc_mismatch, key=lambda x: x['date']):
-            parts.append(f'<tr><td {td}>{m["row"]}</td><td {td}>{m["module"]}</td>'
-                         f'<td {td}>{m["date"]}</td><td {td}>{m["host"]}</td>'
-                         f'<td {td}>{m["method"]}</td><td {td}>{m["lcs_tc_id"]}</td>'
-                         f'<td {td}>{", ".join(m["crm_tc_ids"])}</td></tr>')
-        parts.append('</table>')
-
-    return '\n'.join(parts)
-
-
-def print_report(checked, missing, tc_mismatch):
+def print_report(checked, missing, date_diff, tc_mismatch, duplicates):
     print(f"LCS rows checked (2026+, active, non-admin): {checked}")
+
     print(f"\n{'='*70}")
     print(f"MISSING FROM CRM ({len(missing)} entries)")
     print(f"{'='*70}")
@@ -325,9 +363,21 @@ def print_report(checked, missing, tc_mismatch):
         rep  = f'  [{m["host_rep"]}]' if m['host_rep'] else ''
         link = f'  [CRM link: {m["crm_link"][:60]}]' if m['crm_link'] else ''
         print(f"  Row {m['row']:<5} {m['module']:<25} {m['date']}  {m['host']}{rep}{link}")
+
+    print(f"\n{'='*70}")
+    print(f"DUPLICATE TMs IN CRM ({len(duplicates)} TM numbers with >1 record)")
+    print(f"{'='*70}")
+    for d in duplicates:
+        flag = '  <-- different TC links' if len(d['tc_ids']) > 1 else ''
+        print(f"  {d['tm_number']}  x{d['count']}{flag}")
+        for n in d['names']:
+            print(f"         {n}")
+        if len(d['tc_ids']) > 1:
+            print(f"         TC ids: {', '.join(d['tc_ids'])}")
+
     if tc_mismatch:
         print(f"\n{'='*70}")
-        print(f"TC LINK MISMATCHES ({len(tc_mismatch)} entries)")
+        print(f"TC LINK MISMATCHES ({len(tc_mismatch)} entries — date-confirmed match, TC differs)")
         print(f"{'='*70}")
         for m in sorted(tc_mismatch, key=lambda x: x['date']):
             print(f"  Row {m['row']:<5} {m['module']:<25} {m['date']}  {m['host']}")
@@ -336,33 +386,243 @@ def print_report(checked, missing, tc_mismatch):
             print(f"         CRM TM TC(s) : {', '.join(m['crm_tc_ids'])}")
             print(f"         CRM TM name  : {'; '.join(m['crm_tms'])}")
 
+    if date_diff:
+        print(f"\n{'='*70}")
+        print(f"SERIES FOUND, DATE DIFFERS ({len(date_diff)} entries — series in CRM, no run within ±{DATE_WINDOW}d)")
+        print(f"{'='*70}")
+        for m in sorted(date_diff, key=lambda x: x['date']):
+            print(f"  Row {m['row']:<5} {m['module']:<25} {m['date']}  {m['host']}")
+            print(f"         CRM run dates: {', '.join(m['crm_dates'])}")
 
-def send_email(subject, html_body):
-    api_key  = os.environ.get('SENDGRID_API_KEY', '')
-    to_email = os.environ.get('REPORT_EMAIL', 'chris@imaa.world')
-    if not api_key:
-        print("\n(No SENDGRID_API_KEY set — report logged above, no email sent.)")
-        return
-    resp = requests.post(
-        'https://api.sendgrid.com/v3/mail/send',
-        headers={'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'},
-        json={
-            'personalizations': [{'to': [{'email': to_email}]}],
-            'from': {'email': 'noreply@imaa.world', 'name': 'LCS Recon'},
-            'subject': subject,
-            'content': [{'type': 'text/html', 'value': html_body}],
-        }
-    )
-    if resp.status_code == 202:
-        print(f"Report emailed to {to_email}")
+
+# ── HTML report ───────────────────────────────────────────────────────────────────
+def tc_link(tc_id):
+    if not tc_id:
+        return '<span class="muted">—</span>'
+    url = f'https://crm.zoho.com/crm/org{CRM_ORG}/tab/{TC_TAB}/{tc_id}'
+    return f'<a href="{url}" target="_blank">{tc_id[-7:]}</a>'
+
+
+def build_report_html(checked, missing, date_diff, tc_mismatch, duplicates, run_date, generated_at):
+    esc = html.escape
+    dup_conflict = [d for d in duplicates if len(d['tc_ids']) > 1]
+
+    def card(n, label, cls):
+        return f'<div class="card {cls}"><div class="num">{n}</div><div class="lbl">{label}</div></div>'
+
+    out = [f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LCS Reconciliation — {run_date}</title>
+<style>
+  :root {{ --red:#c0392b; --orange:#d35400; --amber:#b8860b; --blue:#2c6fbb; --line:#e1e4e8; }}
+  body {{ font:14px/1.5 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; color:#24292e; margin:0; background:#fafbfc; }}
+  .wrap {{ max-width:1100px; margin:0 auto; padding:24px; }}
+  h1 {{ font-size:22px; margin:0 0 4px; }}
+  .sub {{ color:#586069; margin:0 0 20px; }}
+  .cards {{ display:flex; gap:12px; flex-wrap:wrap; margin-bottom:28px; }}
+  .card {{ flex:1; min-width:120px; border:1px solid var(--line); border-radius:8px; padding:14px 16px; background:#fff; border-left:4px solid #ccc; }}
+  .card .num {{ font-size:28px; font-weight:700; }}
+  .card .lbl {{ color:#586069; font-size:12px; text-transform:uppercase; letter-spacing:.04em; }}
+  .card.red {{ border-left-color:var(--red); }} .card.orange {{ border-left-color:var(--orange); }}
+  .card.amber {{ border-left-color:var(--amber); }} .card.blue {{ border-left-color:var(--blue); }}
+  section {{ background:#fff; border:1px solid var(--line); border-radius:8px; margin-bottom:24px; overflow:hidden; }}
+  section > h2 {{ font-size:15px; margin:0; padding:12px 16px; border-bottom:1px solid var(--line); border-left:4px solid #ccc; }}
+  section.red > h2 {{ border-left-color:var(--red); }} section.orange > h2 {{ border-left-color:var(--orange); }}
+  section.amber > h2 {{ border-left-color:var(--amber); }} section.blue > h2 {{ border-left-color:var(--blue); }}
+  section .desc {{ color:#586069; padding:4px 16px 0; font-size:13px; }}
+  table {{ width:100%; border-collapse:collapse; font-size:13px; }}
+  th, td {{ text-align:left; padding:7px 16px; border-top:1px solid var(--line); vertical-align:top; }}
+  th {{ background:#f6f8fa; font-weight:600; color:#586069; }}
+  td.mono, .mono {{ font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px; }}
+  tr.flag {{ background:#fff8f0; }}
+  .pill {{ display:inline-block; padding:1px 7px; border-radius:10px; font-size:11px; font-weight:600; }}
+  .pill.bad {{ background:#fde8e6; color:var(--red); }}
+  .diff {{ color:var(--red); font-weight:600; }}
+  .muted {{ color:#959da5; }}
+  .empty {{ padding:14px 16px; color:#22863a; }}
+  a {{ color:var(--blue); text-decoration:none; }} a:hover {{ text-decoration:underline; }}
+</style></head><body><div class="wrap">
+<h1>LCS Reconciliation Report</h1>
+<p class="sub">LCS &ldquo;Courses&rdquo; sheet vs Zoho CRM Training_Modules (2026+) · {checked} rows checked</p>
+<p class="sub"><strong>Last updated:</strong> {generated_at}</p>
+<div class="cards">
+  {card(len(missing), 'Missing from CRM', 'red')}
+  {card(len(dup_conflict), 'Duplicate TMs (TC conflict)', 'orange')}
+  {card(len(tc_mismatch), 'TC link mismatches', 'amber')}
+  {card(len(date_diff), 'Series found, date differs', 'blue')}
+</div>
+"""]
+
+    # Missing
+    out.append('<section class="red"><h2>Missing from CRM</h2>')
+    out.append('<p class="desc">In the LCS sheet but no matching Training_Module in CRM.</p>')
+    if missing:
+        out.append('<table><tr><th>Row</th><th>Module</th><th>Date</th><th>Host</th><th>Host rep</th></tr>')
+        for m in sorted(missing, key=lambda x: x['date']):
+            out.append(f'<tr><td>{m["row"]}</td><td class="mono">{esc(m["module"])}</td>'
+                       f'<td class="mono">{m["date"]}</td><td>{esc(m["host"])}</td>'
+                       f'<td class="muted">{esc(m["host_rep"])}</td></tr>')
+        out.append('</table>')
     else:
-        print(f"SendGrid error {resp.status_code}: {resp.text}", file=sys.stderr)
+        out.append('<p class="empty">None — all checked rows found in CRM.</p>')
+    out.append('</section>')
+
+    # Duplicate TMs
+    out.append('<section class="orange"><h2>Duplicate Training_Modules in CRM</h2>')
+    out.append(f'<p class="desc">Same TM identifier on more than one CRM record. '
+               f'<strong>{len(dup_conflict)}</strong> of {len(duplicates)} point at <em>different</em> Training_Courses (highlighted) — these corrupt matching.</p>')
+    if duplicates:
+        out.append('<table><tr><th>TM</th><th>#</th><th>Records (date / host)</th><th>Training_Course link(s)</th></tr>')
+        for d in sorted(duplicates, key=lambda x: (len(x['tc_ids']) < 2, x['tm_number'])):
+            conflict = len(d['tc_ids']) > 1
+            rows = '<br>'.join(esc(r['name']) for r in d['records'])
+            tcs  = ' '.join(tc_link(t) for t in d['tc_ids']) or '<span class="muted">—</span>'
+            badge = ' <span class="pill bad">conflict</span>' if conflict else ''
+            out.append(f'<tr class="{ "flag" if conflict else "" }">'
+                       f'<td class="mono">{esc(d["tm_number"])}{badge}</td>'
+                       f'<td>{d["count"]}</td><td class="mono">{rows}</td>'
+                       f'<td class="mono">{tcs}</td></tr>')
+        out.append('</table>')
+    else:
+        out.append('<p class="empty">No duplicate TMs found.</p>')
+    out.append('</section>')
+
+    # TC mismatches
+    out.append('<section class="amber"><h2>TC Link Mismatches</h2>')
+    out.append('<p class="desc">Date-confirmed match, but the sheet&rsquo;s Training_Course link differs from CRM&rsquo;s. '
+               'Note: many reflect a per-module vs per-course granularity difference, not a data error.</p>')
+    if tc_mismatch:
+        out.append('<table><tr><th>Row</th><th>Module</th><th>Date</th><th>Host</th>'
+                   '<th>Sheet TC</th><th>CRM TC</th><th>CRM TM</th></tr>')
+        for m in sorted(tc_mismatch, key=lambda x: x['date']):
+            crm_tc = ' '.join(tc_link(t) for t in m['crm_tc_ids']) or '<span class="muted">—</span>'
+            out.append(f'<tr><td>{m["row"]}</td><td class="mono">{esc(m["module"])}</td>'
+                       f'<td class="mono">{m["date"]}</td><td>{esc(m["host"])}</td>'
+                       f'<td class="mono diff">{tc_link(m["lcs_tc_id"])}</td>'
+                       f'<td class="mono">{crm_tc}</td>'
+                       f'<td class="mono muted">{esc("; ".join(m["crm_tms"]))}</td></tr>')
+        out.append('</table>')
+    else:
+        out.append('<p class="empty">No TC mismatches.</p>')
+    out.append('</section>')
+
+    # Date differs
+    out.append('<section class="blue"><h2>Series Found, Date Differs</h2>')
+    out.append(f'<p class="desc">Series exists in CRM but no run within &plusmn;{DATE_WINDOW} days of the sheet date '
+               '(often reused S-numbers / schedule drift).</p>')
+    if date_diff:
+        out.append('<table><tr><th>Row</th><th>Module</th><th>Sheet date</th><th>Host</th><th>CRM run dates</th></tr>')
+        for m in sorted(date_diff, key=lambda x: x['date']):
+            out.append(f'<tr><td>{m["row"]}</td><td class="mono">{esc(m["module"])}</td>'
+                       f'<td class="mono">{m["date"]}</td><td>{esc(m["host"])}</td>'
+                       f'<td class="mono muted">{esc(", ".join(m["crm_dates"]))}</td></tr>')
+        out.append('</table>')
+    else:
+        out.append('<p class="empty">None.</p>')
+    out.append('</section>')
+
+    out.append('</div></body></html>')
+    return '\n'.join(out)
+
+
+# ── Publish to here.now ───────────────────────────────────────────────────────────
+def herenow_api_key():
+    """API key from $HERENOW_API_KEY or ~/.herenow/credentials (needed for a password)."""
+    key = os.environ.get('HERENOW_API_KEY')
+    if key:
+        return key.strip()
+    try:
+        with open(HERENOW_CRED) as f:
+            return f.read().strip() or None
+    except FileNotFoundError:
+        return None
+
+
+def publish_to_herenow(html_path, password=None, ttl_seconds=None):
+    """Publish the report to a FIXED here.now URL.
+
+    The site slug is remembered in HERENOW_SLUG; subsequent runs PUT a new
+    version to that same slug so the dashboard URL never changes. An API key is
+    required for a stable, owned, password-protected site.
+    """
+    data    = open(html_path, 'rb').read()
+    api_key = herenow_api_key()
+    auth    = {'Authorization': f'Bearer {api_key}'} if api_key else {}
+
+    body = {'files': [{'path': 'index.html', 'size': len(data), 'contentType': 'text/html'}],
+            'viewer': {'title': 'LCS Reconciliation Report',
+                       'description': 'LCS sheet vs Zoho CRM Training_Modules'}}
+    if ttl_seconds:
+        body['ttlSeconds'] = ttl_seconds
+
+    try:
+        with open(HERENOW_SLUG) as f:
+            slug = f.read().strip() or None
+    except FileNotFoundError:
+        slug = None
+
+    # Update the existing site in place (PUT) when we have a slug + key; else create one.
+    r = None
+    if slug and api_key:
+        r = requests.put(f'{HERENOW_API}/publish/{slug}',
+                         headers={'Content-Type': 'application/json', **auth}, json=body)
+        if not r.ok:
+            print(f"  (stored slug '{slug}' not updatable: HTTP {r.status_code} — creating a new site)")
+            r = None
+    if r is None:
+        r = requests.post(f'{HERENOW_API}/publish',
+                          headers={'Content-Type': 'application/json', **auth}, json=body)
+    r.raise_for_status()
+    j    = r.json()
+    slug = j['slug']
+    up   = j['upload']
+    u0   = up['uploads'][0]
+
+    requests.put(u0['url'], headers=u0.get('headers') or {}, data=data).raise_for_status()
+    fr = requests.post(up['finalizeUrl'], headers={'Content-Type': 'application/json', **auth},
+                       json={'versionId': up['versionId']})
+    fr.raise_for_status()
+    site_url = fr.json().get('siteUrl') or j.get('siteUrl')
+
+    # Remember the slug so the URL stays fixed across runs.
+    with open(HERENOW_SLUG, 'w') as f:
+        f.write(slug)
+
+    if password:
+        if not api_key:
+            print("  WARNING: a password needs a here.now API key — published WITHOUT a password.")
+        else:
+            pr = requests.patch(f'{HERENOW_API}/publish/{slug}/metadata',
+                                headers={'Content-Type': 'application/json', **auth},
+                                json={'password': password})
+            pr.raise_for_status()
+            print("  password protection enabled")
+
+    print(f"  Live URL : {site_url}")
+    if j.get('anonymous'):
+        print(f"  (anonymous — expires {j.get('expiresAt')})")
+    return site_url
 
 
 # ── Main ────────────────────────────────────────────────────────────────────────
+def parse_args():
+    p = argparse.ArgumentParser(description='LCS vs Zoho CRM reconciliation.')
+    p.add_argument('--publish', action='store_true',
+                   help='publish the HTML report to here.now')
+    p.add_argument('--password', default=os.environ.get('HERENOW_PASSWORD'),
+                   help='password-protect the published site (implies --publish; needs a here.now API key)')
+    p.add_argument('--ttl', type=int, default=None,
+                   help='here.now site lifetime in seconds (anonymous sites default to 24h)')
+    return p.parse_args()
+
+
 def main():
-    run_date = datetime.utcnow().strftime('%Y-%m-%d')
-    print(f"=== LCS Reconciliation {run_date} ===\n")
+    args = parse_args()
+    run_dt       = datetime.now(timezone.utc)
+    run_date     = run_dt.strftime('%Y-%m-%d')
+    generated_at = run_dt.strftime('%Y-%m-%d %H:%M:%S UTC')
+    print(f"=== LCS Reconciliation {generated_at} ===\n")
 
     print("Fetching Zoho access token...")
     zoho_token = get_zoho_token()
@@ -376,13 +636,18 @@ def main():
     lcs_rows = fetch_lcs_sheet(google_token)
     print(f"  Loaded {len(lcs_rows)} rows\n")
 
-    checked, missing, tc_mismatch = reconcile(lcs_rows, crm_records)
-    print_report(checked, missing, tc_mismatch)
+    duplicates = find_duplicate_tms(crm_records)
+    checked, missing, date_diff, tc_mismatch = reconcile(lcs_rows, crm_records)
+    print_report(checked, missing, date_diff, tc_mismatch, duplicates)
 
-    n = len(missing)
-    subject = f"LCS Recon {run_date} — {n} missing TM{'s' if n != 1 else ''}"
-    html    = build_report_html(checked, missing, tc_mismatch, run_date)
-    send_email(subject, html)
+    html_doc = build_report_html(checked, missing, date_diff, tc_mismatch, duplicates, run_date, generated_at)
+    with open(REPORT_HTML, 'w') as f:
+        f.write(html_doc)
+    print(f"\nHTML report written to {os.path.abspath(REPORT_HTML)}")
+
+    if args.publish or args.password:
+        print("\nPublishing to here.now...")
+        publish_to_herenow(REPORT_HTML, password=args.password, ttl_seconds=args.ttl)
 
 
 if __name__ == '__main__':

@@ -1,0 +1,16 @@
+# Local environment
+.venv/
+.env
+*.pyc
+__pycache__/
+
+# Generated report (contains internal course data)
+report.html
+
+# here.now fixed-site pointer + cron log
+.herenow-slug
+cron.log
+
+# Credentials — never commit
+google-service-account.json
+*-service-account.json

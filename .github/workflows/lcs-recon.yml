@@ -1,0 +1,31 @@
+name: LCS Reconciliation
+
+on:
+  schedule:
+    # Every ~3 days at 09:00 UTC (adjust to your preferred time)
+    - cron: '0 9 1,4,7,10,13,16,19,22,25,28 * *'
+  workflow_dispatch:   # allows manual "Run workflow" trigger from GitHub UI
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests google-auth google-auth-httplib2
+
+      - name: Run reconciliation
+        env:
+          ZOHO_CLIENT_ID:              ${{ secrets.ZOHO_CLIENT_ID }}
+          ZOHO_CLIENT_SECRET:          ${{ secrets.ZOHO_CLIENT_SECRET }}
+          ZOHO_REFRESH_TOKEN:          ${{ secrets.ZOHO_REFRESH_TOKEN }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          SENDGRID_API_KEY:            ${{ secrets.SENDGRID_API_KEY }}
+          REPORT_EMAIL:                chris@imaa.world
+        run: python scripts/recon.py
